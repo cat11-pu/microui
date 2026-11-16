@@ -105,6 +105,16 @@ enum {
   MU_KEY_RETURN       = (1 << 4)
 };
 
+/* error codes reported through `ctx->error` / mu_error_string(). stack
+** errors are non-fatal: the offending operation is rejected, the error is
+** recorded and the library keeps running in a consistent state */
+enum {
+  MU_ERROR_NONE             = 0,
+  MU_ERROR_STACK_OVERFLOW   = 1,
+  MU_ERROR_STACK_UNDERFLOW  = 2,
+  MU_ERROR_STACK_UNBALANCED = 3
+};
+
 
 typedef struct mu_Context mu_Context;
 typedef unsigned mu_Id;
@@ -196,6 +206,11 @@ struct mu_Context {
   mu_stack(mu_Rect, MU_CLIPSTACK_SIZE) clip_stack;
   mu_stack(mu_Id, MU_IDSTACK_SIZE) id_stack;
   mu_stack(mu_Layout, MU_LAYOUTSTACK_SIZE) layout_stack;
+  /* error state: `error`/`error_stack` describe the first error since the
+  ** last mu_clear_error(); `error_count` totals all reported errors */
+  int error;
+  int error_count;
+  const char *error_stack;
   /* retained state pools */
   mu_PoolItem container_pool[MU_CONTAINERPOOL_SIZE];
   mu_Container containers[MU_CONTAINERPOOL_SIZE];
@@ -228,6 +243,8 @@ void mu_push_clip_rect(mu_Context *ctx, mu_Rect rect);
 void mu_pop_clip_rect(mu_Context *ctx);
 mu_Rect mu_get_clip_rect(mu_Context *ctx);
 int mu_check_clip(mu_Context *ctx, mu_Rect r);
+const char* mu_error_string(mu_Context *ctx);
+void mu_clear_error(mu_Context *ctx);
 mu_Container* mu_get_current_container(mu_Context *ctx);
 mu_Container* mu_get_container(mu_Context *ctx, const char *name);
 void mu_bring_to_front(mu_Context *ctx, mu_Container *cnt);

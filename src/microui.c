@@ -35,15 +35,45 @@
     }                                                                \
   } while (0)
 
+static void report_error(mu_Context *ctx, int code, const char *stack) {
+  static const char *names[] = {
+    "no error", "stack overflow", "stack underflow", "unbalanced stack"
+  };
+  ctx->error_count++;
+  /* keep the first error until it is cleared so `ctx->error` always
+  ** describes the root cause; later errors only bump the counter */
+  if (ctx->error == MU_ERROR_NONE) {
+    ctx->error = code;
+    ctx->error_stack = stack;
+    fprintf(stderr, "microui: %s on %s\n", names[code], stack);
+  }
+}
+
+
 #define push(stk, val) do {                                                 \
-    expect((stk).idx < (int) (sizeof((stk).items) / sizeof(*(stk).items))); \
-    (stk).items[(stk).idx] = (val);                                         \
-    (stk).idx++; /* incremented after incase `val` uses this value */       \
+    if ((stk).idx >= (int) (sizeof((stk).items) / sizeof(*(stk).items))) {  \
+      report_error(ctx, MU_ERROR_STACK_OVERFLOW, #stk);                     \
+    } else {                                                                \
+      (stk).items[(stk).idx] = (val);                                       \
+      (stk).idx++; /* incremented after incase `val` uses this value */     \
+    }                                                                       \
   } while (0)
 
-#define pop(stk) do {      \
-    expect((stk).idx > 0); \
-    (stk).idx--;           \
+#define pop(stk) do {                                         \
+    if ((stk).idx <= 0) {                                     \
+      report_error(ctx, MU_ERROR_STACK_UNDERFLOW, #stk);      \
+    } else {                                                  \
+      (stk).idx--;                                            \
+    }                                                         \
+  } while (0)
+
+/* used by mu_end(): a non-zero stack means a begin/end pair was not
+** balanced by the caller; report it and reset so the next frame is clean */
+#define check_balanced(stk) do {                              \
+    if ((stk).idx != 0) {                                     \
+      report_error(ctx, MU_ERROR_STACK_UNBALANCED, #stk);     \
+      (stk).idx = 0;                                          \
+    }                                                         \
   } while (0)
 
 
@@ -155,11 +185,12 @@ static int compare_zindex(const void *a, const void *b) {
 
 void mu_end(mu_Context *ctx) {
   int i, n;
-  /* check stacks */
-  expect(ctx->container_stack.idx == 0);
-  expect(ctx->clip_stack.idx      == 0);
-  expect(ctx->id_stack.idx        == 0);
-  expect(ctx->layout_stack.idx    == 0);
+  /* check stacks: report unbalanced begin/end pairs and recover by
+  ** resetting the stacks so the next frame starts from a clean state */
+  check_balanced(ctx->container_stack);
+  check_balanced(ctx->clip_stack);
+  check_balanced(ctx->id_stack);
+  check_balanced(ctx->layout_stack);
 
   /* handle scroll input */
   if (ctx->scroll_target) {
@@ -193,17 +224,17 @@ void mu_end(mu_Context *ctx) {
   /* set root container jump commands */
   for (i = 0; i < n; i++) {
     mu_Container *cnt = ctx->root_list.items[i];
+    mu_Container *prev = (i > 0) ? ctx->root_list.items[i - 1] : NULL;
     /* if this is the first container then make the first command jump to it.
     ** otherwise set the previous container's tail to jump to this one */
     if (i == 0) {
       mu_Command *cmd = (mu_Command*) ctx->command_list.items;
       cmd->jump.dst = (char*) cnt->head + sizeof(mu_JumpCommand);
-    } else {
-      mu_Container *prev = ctx->root_list.items[i - 1];
+    } else if (prev->tail) {
       prev->tail->jump.dst = (char*) cnt->head + sizeof(mu_JumpCommand);
     }
     /* make the last container's tail jump to the end of command list */
-    if (i == n - 1) {
+    if (i == n - 1 && cnt->tail) {
       cnt->tail->jump.dst = ctx->command_list.items + ctx->command_list.idx;
     }
   }
@@ -258,8 +289,30 @@ void mu_pop_clip_rect(mu_Context *ctx) {
 
 
 mu_Rect mu_get_clip_rect(mu_Context *ctx) {
-  expect(ctx->clip_stack.idx > 0);
+  if (ctx->clip_stack.idx <= 0) {
+    report_error(ctx, MU_ERROR_STACK_UNDERFLOW, "ctx->clip_stack");
+    /* fail safe: return the unclipped rect so drawing continues instead
+    ** of crashing on an empty clip stack */
+    return unclipped_rect;
+  }
   return ctx->clip_stack.items[ctx->clip_stack.idx - 1];
+}
+
+
+const char* mu_error_string(mu_Context *ctx) {
+  switch (ctx->error) {
+    case MU_ERROR_NONE:             return "no error";
+    case MU_ERROR_STACK_OVERFLOW:   return "stack overflow";
+    case MU_ERROR_STACK_UNDERFLOW:  return "stack underflow";
+    case MU_ERROR_STACK_UNBALANCED: return "unbalanced stack";
+  }
+  return "unknown error";
+}
+
+
+void mu_clear_error(mu_Context *ctx) {
+  ctx->error = MU_ERROR_NONE;
+  ctx->error_stack = NULL;
 }
 
 
@@ -285,6 +338,13 @@ static void push_layout(mu_Context *ctx, mu_Rect body, mu_Vec2 scroll) {
 
 
 static mu_Layout* get_layout(mu_Context *ctx) {
+  static mu_Layout fallback;
+  if (ctx->layout_stack.idx <= 0) {
+    report_error(ctx, MU_ERROR_STACK_UNDERFLOW, "ctx->layout_stack");
+    /* fail safe: hand out a scratch layout so callers can keep going */
+    memset(&fallback, 0, sizeof(fallback));
+    return &fallback;
+  }
   return &ctx->layout_stack.items[ctx->layout_stack.idx - 1];
 }
 
@@ -302,7 +362,13 @@ static void pop_container(mu_Context *ctx) {
 
 
 mu_Container* mu_get_current_container(mu_Context *ctx) {
-  expect(ctx->container_stack.idx > 0);
+  static mu_Container fallback;
+  if (ctx->container_stack.idx <= 0) {
+    report_error(ctx, MU_ERROR_STACK_UNDERFLOW, "ctx->container_stack");
+    /* fail safe: hand out a scratch container so callers can keep going */
+    memset(&fallback, 0, sizeof(fallback));
+    return &fallback;
+  }
   return ctx->container_stack.items[ ctx->container_stack.idx - 1 ];
 }
 
@@ -1054,6 +1120,9 @@ static void begin_root_container(mu_Context *ctx, mu_Container *cnt) {
   /* push container to roots list and push head command */
   push(ctx->root_list, cnt);
   cnt->head = push_jump(ctx, NULL);
+  /* clear the tail jump: if the matching end call is never made the tail
+  ** would otherwise point into a previous frame's command list */
+  cnt->tail = NULL;
   /* set as hover root if the mouse is overlapping this container and it has a
   ** higher zindex than the current hover root */
   if (rect_overlaps_vec2(cnt->rect, ctx->mouse_pos) &&
@@ -1073,7 +1142,9 @@ static void end_root_container(mu_Context *ctx) {
   ** on initing these are done in mu_end() */
   mu_Container *cnt = mu_get_current_container(ctx);
   cnt->tail = push_jump(ctx, NULL);
-  cnt->head->jump.dst = ctx->command_list.items + ctx->command_list.idx;
+  if (cnt->head) {
+    cnt->head->jump.dst = ctx->command_list.items + ctx->command_list.idx;
+  }
   /* pop base clip rect and container */
   mu_pop_clip_rect(ctx);
   pop_container(ctx);

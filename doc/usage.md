@@ -4,6 +4,7 @@
 * **[Layout System](#layout-system)**
 * **[Style Customisation](#style-customisation)**
 * **[Custom Controls](#custom-controls)**
+* **[Error Handling](#error-handling)**
 
 ## Overview
 The overall structure when using the library is as follows:
@@ -249,3 +250,21 @@ int incrementer(mu_Context *ctx, int *value) {
   return res;
 }
 ```
+
+## Error Handling
+Stack misuse (e.g. `mu_begin_window()` without the matching `mu_end_window()`,
+popping more than was pushed, or nesting deeper than the stack capacities)
+does not abort the program. The offending operation is rejected, an error is
+recorded on the context and the library keeps running in a consistent state;
+`mu_end()` resets any unbalanced stacks so the next frame starts clean.
+
+```c
+if (ctx->error != MU_ERROR_NONE) {
+  printf("microui: %s on %s\n", mu_error_string(ctx), ctx->error_stack);
+  mu_clear_error(ctx);
+}
+```
+
+`ctx->error` keeps the first error (`MU_ERROR_STACK_OVERFLOW`,
+`MU_ERROR_STACK_UNDERFLOW` or `MU_ERROR_STACK_UNBALANCED`) until
+`mu_clear_error()` is called; `ctx->error_count` totals all reported errors.
