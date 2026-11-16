@@ -458,6 +458,16 @@ static mu_Command* push_jump(mu_Context *ctx, mu_Command *dst) {
 
 void mu_set_clip(mu_Context *ctx, mu_Rect rect) {
   mu_Command *cmd;
+  /* merge with the previous command if it is an identical clip command */
+  if (ctx->command_list.idx >= (int) sizeof(mu_ClipCommand)) {
+    mu_Command *last = (mu_Command*) (
+      ctx->command_list.items + ctx->command_list.idx - sizeof(mu_ClipCommand));
+    if (last->type == MU_COMMAND_CLIP &&
+        last->clip.rect.x == rect.x && last->clip.rect.y == rect.y &&
+        last->clip.rect.w == rect.w && last->clip.rect.h == rect.h) {
+      return;
+    }
+  }
   cmd = mu_push_command(ctx, MU_COMMAND_CLIP, sizeof(mu_ClipCommand));
   cmd->clip.rect = rect;
 }
@@ -465,12 +475,19 @@ void mu_set_clip(mu_Context *ctx, mu_Rect rect) {
 
 void mu_draw_rect(mu_Context *ctx, mu_Rect rect, mu_Color color) {
   mu_Command *cmd;
-  rect = intersect_rects(rect, mu_get_clip_rect(ctx));
-  if (rect.w > 0 && rect.h > 0) {
-    cmd = mu_push_command(ctx, MU_COMMAND_RECT, sizeof(mu_RectCommand));
-    cmd->rect.rect = rect;
-    cmd->rect.color = color;
+  mu_Rect cr;
+  /* a fully transparent rect produces no output: skip it */
+  if (color.a == 0) { return; }
+  cr = mu_get_clip_rect(ctx);
+  /* fast path: rect fully inside the clip rect needs no intersection */
+  if (rect.x < cr.x || rect.y < cr.y ||
+      rect.x + rect.w > cr.x + cr.w || rect.y + rect.h > cr.y + cr.h) {
+    rect = intersect_rects(rect, cr);
+    if (rect.w <= 0 || rect.h <= 0) { return; }
   }
+  cmd = mu_push_command(ctx, MU_COMMAND_RECT, sizeof(mu_RectCommand));
+  cmd->rect.rect = rect;
+  cmd->rect.color = color;
 }
 
 
@@ -482,13 +499,17 @@ void mu_draw_box(mu_Context *ctx, mu_Rect rect, mu_Color color) {
 }
 
 
-void mu_draw_text(mu_Context *ctx, mu_Font font, const char *str, int len,
-  mu_Vec2 pos, mu_Color color)
+/* like `mu_draw_text` but takes a precomputed text `width`; pass -1 to have
+** it measured. avoids measuring the same string twice per control */
+static void draw_text(mu_Context *ctx, mu_Font font, const char *str, int len,
+  mu_Vec2 pos, mu_Color color, int width)
 {
   mu_Command *cmd;
-  mu_Rect rect = mu_rect(
-    pos.x, pos.y, ctx->text_width(font, str, len), ctx->text_height(font));
-  int clipped = mu_check_clip(ctx, rect);
+  mu_Rect rect;
+  int clipped;
+  if (width < 0) { width = ctx->text_width(font, str, len); }
+  rect = mu_rect(pos.x, pos.y, width, ctx->text_height(font));
+  clipped = mu_check_clip(ctx, rect);
   if (clipped == MU_CLIP_ALL ) { return; }
   if (clipped == MU_CLIP_PART) { mu_set_clip(ctx, mu_get_clip_rect(ctx)); }
   /* add command */
@@ -501,6 +522,13 @@ void mu_draw_text(mu_Context *ctx, mu_Font font, const char *str, int len,
   cmd->text.font = font;
   /* reset clipping if it was set */
   if (clipped) { mu_set_clip(ctx, unclipped_rect); }
+}
+
+
+void mu_draw_text(mu_Context *ctx, mu_Font font, const char *str, int len,
+  mu_Vec2 pos, mu_Color color)
+{
+  draw_text(ctx, font, str, len, pos, color, -1);
 }
 
 
@@ -644,6 +672,9 @@ void mu_draw_control_frame(mu_Context *ctx, mu_Id id, mu_Rect rect,
   int colorid, int opt)
 {
   if (opt & MU_OPT_NOFRAME) { return; }
+  /* skip controls clipped away entirely: the frame and its 1px border
+  ** would emit no visible output */
+  if (mu_check_clip(ctx, expand_rect(rect, 1)) == MU_CLIP_ALL) { return; }
   colorid += (ctx->focus == id) ? 2 : (ctx->hover == id) ? 1 : 0;
   ctx->draw_frame(ctx, rect, colorid);
 }
@@ -654,7 +685,11 @@ void mu_draw_control_text(mu_Context *ctx, const char *str, mu_Rect rect,
 {
   mu_Vec2 pos;
   mu_Font font = ctx->style->font;
-  int tw = ctx->text_width(font, str, -1);
+  int tw;
+  /* skip controls clipped away entirely: the text is clipped to the
+  ** control rect, so nothing could be visible */
+  if (mu_check_clip(ctx, rect) == MU_CLIP_ALL) { return; }
+  tw = ctx->text_width(font, str, -1);
   mu_push_clip_rect(ctx, rect);
   pos.y = rect.y + (rect.h - ctx->text_height(font)) / 2;
   if (opt & MU_OPT_ALIGNCENTER) {
@@ -664,7 +699,7 @@ void mu_draw_control_text(mu_Context *ctx, const char *str, mu_Rect rect,
   } else {
     pos.x = rect.x + ctx->style->padding;
   }
-  mu_draw_text(ctx, font, str, -1, pos, ctx->style->colors[colorid]);
+  draw_text(ctx, font, str, -1, pos, ctx->style->colors[colorid], tw);
   mu_pop_clip_rect(ctx);
 }
 
@@ -800,21 +835,23 @@ int mu_textbox_raw(mu_Context *ctx, char *buf, int bufsz, mu_Id id, mu_Rect r,
   }
 
   /* draw */
-  mu_draw_control_frame(ctx, id, r, MU_COLOR_BASE, opt);
-  if (ctx->focus == id) {
-    mu_Color color = ctx->style->colors[MU_COLOR_TEXT];
-    mu_Font font = ctx->style->font;
-    int textw = ctx->text_width(font, buf, -1);
-    int texth = ctx->text_height(font);
-    int ofx = r.w - ctx->style->padding - textw - 1;
-    int textx = r.x + mu_min(ofx, ctx->style->padding);
-    int texty = r.y + (r.h - texth) / 2;
-    mu_push_clip_rect(ctx, r);
-    mu_draw_text(ctx, font, buf, -1, mu_vec2(textx, texty), color);
-    mu_draw_rect(ctx, mu_rect(textx + textw, texty, 1, texth), color);
-    mu_pop_clip_rect(ctx);
-  } else {
-    mu_draw_control_text(ctx, buf, r, MU_COLOR_TEXT, opt);
+  if (mu_check_clip(ctx, expand_rect(r, 1)) != MU_CLIP_ALL) {
+    mu_draw_control_frame(ctx, id, r, MU_COLOR_BASE, opt);
+    if (ctx->focus == id) {
+      mu_Color color = ctx->style->colors[MU_COLOR_TEXT];
+      mu_Font font = ctx->style->font;
+      int textw = ctx->text_width(font, buf, -1);
+      int texth = ctx->text_height(font);
+      int ofx = r.w - ctx->style->padding - textw - 1;
+      int textx = r.x + mu_min(ofx, ctx->style->padding);
+      int texty = r.y + (r.h - texth) / 2;
+      mu_push_clip_rect(ctx, r);
+      mu_draw_text(ctx, font, buf, -1, mu_vec2(textx, texty), color);
+      mu_draw_rect(ctx, mu_rect(textx + textw, texty, 1, texth), color);
+      mu_pop_clip_rect(ctx);
+    } else {
+      mu_draw_control_text(ctx, buf, r, MU_COLOR_TEXT, opt);
+    }
   }
 
   return res;
@@ -876,16 +913,19 @@ int mu_slider_ex(mu_Context *ctx, mu_Real *value, mu_Real low, mu_Real high,
   *value = v = mu_clamp(v, low, high);
   if (last != v) { res |= MU_RES_CHANGE; }
 
-  /* draw base */
-  mu_draw_control_frame(ctx, id, base, MU_COLOR_BASE, opt);
-  /* draw thumb */
-  w = ctx->style->thumb_size;
-  x = (v - low) * (base.w - w) / (high - low);
-  thumb = mu_rect(base.x + x, base.y, w, base.h);
-  mu_draw_control_frame(ctx, id, thumb, MU_COLOR_BUTTON, opt);
-  /* draw text  */
-  sprintf(buf, fmt, v);
-  mu_draw_control_text(ctx, buf, base, MU_COLOR_TEXT, opt);
+  /* draw (skipped entirely if the control is clipped away) */
+  if (mu_check_clip(ctx, expand_rect(base, 1)) != MU_CLIP_ALL) {
+    /* draw base */
+    mu_draw_control_frame(ctx, id, base, MU_COLOR_BASE, opt);
+    /* draw thumb */
+    w = ctx->style->thumb_size;
+    x = (v - low) * (base.w - w) / (high - low);
+    thumb = mu_rect(base.x + x, base.y, w, base.h);
+    mu_draw_control_frame(ctx, id, thumb, MU_COLOR_BUTTON, opt);
+    /* draw text  */
+    sprintf(buf, fmt, v);
+    mu_draw_control_text(ctx, buf, base, MU_COLOR_TEXT, opt);
+  }
 
   return res;
 }
@@ -913,11 +953,14 @@ int mu_number_ex(mu_Context *ctx, mu_Real *value, mu_Real step,
   /* set flag if value changed */
   if (*value != last) { res |= MU_RES_CHANGE; }
 
-  /* draw base */
-  mu_draw_control_frame(ctx, id, base, MU_COLOR_BASE, opt);
-  /* draw text  */
-  sprintf(buf, fmt, *value);
-  mu_draw_control_text(ctx, buf, base, MU_COLOR_TEXT, opt);
+  /* draw (skipped entirely if the control is clipped away) */
+  if (mu_check_clip(ctx, expand_rect(base, 1)) != MU_CLIP_ALL) {
+    /* draw base */
+    mu_draw_control_frame(ctx, id, base, MU_COLOR_BASE, opt);
+    /* draw text  */
+    sprintf(buf, fmt, *value);
+    mu_draw_control_text(ctx, buf, base, MU_COLOR_TEXT, opt);
+  }
 
   return res;
 }
